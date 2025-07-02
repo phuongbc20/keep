@@ -1,11 +1,14 @@
 import enum
 import hashlib
 import logging
+import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from threading import Lock
+
+import redis
 
 from sqlalchemy.exc import IntegrityError
 
@@ -36,6 +39,8 @@ from keep.workflowmanager.workflowstore import WorkflowStore
 
 READ_ONLY_MODE = config("KEEP_READ_ONLY", default="false") == "true"
 MAX_WORKERS = config("WORKFLOWS_MAX_WORKERS", default="20")
+REDIS_DEDUP_ENABLED = os.environ.get("REDIS_DEDUP", "false").lower() == "true"
+REDIS_DEDUP_TTL = int(os.environ.get("REDIS_DEDUP_TTL", "120"))
 
 
 class WorkflowStatus(enum.Enum):
@@ -93,6 +98,37 @@ class WorkflowScheduler:
         )
         self.scheduler_future = None
         self.futures = set()
+        self.redis_client = None
+        if REDIS_DEDUP_ENABLED:
+            try:
+                if os.environ.get("REDIS_SENTINEL_ENABLED", "false").lower() == "true":
+                    hosts = os.environ.get("REDIS_SENTINEL_HOSTS", "localhost:26379").split(",")
+                    sentinels = []
+                    for host in hosts:
+                        if ":" in host:
+                            h, p = host.split(":", 1)
+                            sentinels.append((h.strip(), int(p.strip())))
+                        else:
+                            sentinels.append((host.strip(), 26379))
+                    service_name = os.environ.get("REDIS_SENTINEL_SERVICE_NAME", "mymaster")
+                    sentinel = redis.sentinel.Sentinel(
+                        sentinels,
+                        socket_timeout=5,
+                        password=os.environ.get("REDIS_PASSWORD"),
+                        username=os.environ.get("REDIS_USERNAME"),
+                    )
+                    self.redis_client = sentinel.master_for(service_name, socket_timeout=5)
+                else:
+                    self.redis_client = redis.Redis(
+                        host=os.environ.get("REDIS_HOST", "localhost"),
+                        port=int(os.environ.get("REDIS_PORT", "6379")),
+                        password=os.environ.get("REDIS_PASSWORD"),
+                        username=os.environ.get("REDIS_USERNAME"),
+                        socket_timeout=5,
+                    )
+            except Exception:
+                self.logger.exception("Failed to create redis client for dedup")
+                self.redis_client = None
         # Initialize metrics for queue size
         self._update_queue_metrics()
 
@@ -132,6 +168,30 @@ class WorkflowScheduler:
             workflow_execution_id = workflow.get("workflow_execution_id")
             tenant_id = workflow.get("tenant_id")
             workflow_id = workflow.get("workflow_id")
+            execution_number = workflow.get("execution_number")
+
+            redis_lock_key = None
+            if self.redis_client and execution_number is not None:
+                redis_lock_key = f"workflow-lock:{workflow_id}:{execution_number}"
+                try:
+                    acquired = self.redis_client.set(
+                        redis_lock_key,
+                        workflow_execution_id,
+                        nx=True,
+                        ex=REDIS_DEDUP_TTL,
+                    )
+                    if not acquired:
+                        self.logger.debug(
+                            "Skipping workflow %s due to redis dedup lock",
+                            workflow_id,
+                        )
+                        continue
+                except Exception:
+                    self.logger.exception(
+                        "Failed to acquire redis lock for workflow %s",
+                        workflow_id,
+                    )
+                    redis_lock_key = None
 
             try:
                 workflow_obj = self.workflow_store.get_workflow(tenant_id, workflow_id)
@@ -177,6 +237,9 @@ class WorkflowScheduler:
                 workflow_id,
                 workflow_obj,
                 workflow_execution_id,
+                None,
+                None,
+                redis_lock_key,
             )
             self.futures.add(future)
             future.add_done_callback(lambda f: self.futures.remove(f))
@@ -189,6 +252,7 @@ class WorkflowScheduler:
         workflow_execution_id: str,
         event_context=None,
         inputs=None,
+        redis_lock_key=None,
     ):
         if READ_ONLY_MODE:
             self.logger.debug("Sleeping for 3 seconds in favor of read only mode")
@@ -260,6 +324,14 @@ class WorkflowScheduler:
             # Decrement running workflows counter
             workflows_running.labels(tenant_id=tenant_id).dec()
             self._update_queue_metrics()
+            if redis_lock_key and self.redis_client:
+                try:
+                    self.redis_client.delete(redis_lock_key)
+                except Exception:
+                    self.logger.exception(
+                        "Failed to release redis lock for workflow %s",
+                        workflow_id,
+                    )
 
         if errors is not None and any(errors):
             self.logger.info(msg=f"Workflow {workflow.workflow_id} ran with errors")
@@ -637,6 +709,7 @@ class WorkflowScheduler:
                 workflow_execution_id,
                 event,
                 inputs,
+                None,
             )
             self.futures.add(future)
             future.add_done_callback(lambda f: self.futures.remove(f))
